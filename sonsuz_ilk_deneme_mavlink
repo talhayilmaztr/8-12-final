@@ -1,0 +1,136 @@
+import numpy as np
+import time
+import math
+from pymavlink import mavutil
+
+# === Uçuş Parametreleri ===
+ALT = 10.0
+SPEED = 5.0
+DT = 0.04
+NPTS = 720
+direct_distance = 30.0
+width_ratio = 1.4
+yaw_deg = 0.0
+R = 6378137.0
+
+# === MAVLink Bağlantısı ===
+master = mavutil.mavlink_connection('/dev/ttyAMA0', baud=57600)
+master.wait_heartbeat()
+print("✔ MAVLink bağlantısı kuruldu. Heartbeat alındı.")
+
+# === Parametre Ayarları ===
+def set_param(param_id, param_value):
+    master.mav.param_set_send(
+        master.target_system,
+        master.target_component,
+        param_id.encode('utf-8'),
+        param_value,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+    time.sleep(1)
+    while True:
+        msg = master.recv_match(type='PARAM_VALUE', blocking=True)
+        if msg.param_id.strip() == param_id:
+            break
+
+# === Mod Ayarı ===
+def set_mode(mode):
+    mode_id = master.mode_mapping()[mode]
+    master.set_mode(mode_id)
+    while True:
+        ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)
+        if ack_msg.command == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+            break
+
+# === Hedef Konuma Git (NED çerçevesinde) ===
+def goto_NED(n, e, d):
+    master.mav.set_position_target_local_ned_send(
+        0, master.target_system, master.target_component,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        int(0b110111111000),
+        n, e, d,
+        0, 0, 0,
+        0, 0, 0,
+        0, 0
+    )
+    time.sleep(DT)
+
+# === Takeoff ===
+def takeoff(alt):
+    print(f"⬆ {alt}m irtifaya kalkılıyor...")
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        0, 0, 0, 0, 0, 0, 0, alt
+    )
+    time.sleep(10)
+
+# === ∞ Rota Oluşturma ===
+def build_geometry(D, width_ratio):
+    H = D / 2.0
+    W = width_ratio * H
+    AB = H / math.sqrt(2.0)
+    Cn, Ce = 0.0, -W/2.0
+    tB = math.pi / 4
+    B = (Cn + H * math.cos(tB), Ce + (W / 2.0) * math.sin(2 * tB))
+    return H, W, Cn, Ce, AB, tB, B
+
+def infinity_path(Cn, Ce, H, W, t_start, npts=NPTS):
+    t = np.linspace(t_start, t_start - 2 * math.pi, npts, endpoint=True)
+    N = Cn + H * np.cos(t)
+    E = Ce + (W / 2.0) * np.sin(2 * t)
+    return list(zip(N, E))
+
+def rotate_points(points, yaw_deg):
+    yaw = math.radians(yaw_deg)
+    c, s = math.cos(yaw), math.sin(yaw)
+    return [(c * n - s * e, s * n + c * e) for (n, e) in points]
+
+# === Uçuş Başlat ===
+try:
+    # 1. Arm ve Mod Ayarları
+    set_param('ARMING_CHECK', 0)
+    set_param('DISARM_DELAY', 127)
+    set_mode('GUIDED')
+    master.arducopter_arm()
+    master.motors_armed_wait()
+    print("✅ Motorlar arm edildi.")
+
+    # 2. Kalkış
+    takeoff(ALT)
+
+    # 3. Geometri Tanımları
+    H, W, Cn, Ce, AB, tB, B_local = build_geometry(direct_distance, width_ratio)
+    A_local = (0.0, 0.0)
+    inf_local = infinity_path(Cn, Ce, H, W, t_start=tB)
+
+    # 4. Yön Dönüşü
+    A_rot = rotate_points([A_local], yaw_deg)[0]
+    B_rot = rotate_points([B_local], yaw_deg)[0]
+    inf_rot = rotate_points(inf_local, yaw_deg)
+
+    # 5. A → B
+    print("📍 A → B yönüne ilerleniyor...")
+    goto_NED(B_rot[0], B_rot[1], -ALT)
+
+    # 6. ∞ rotası (2 tur)
+    print("♾ ∞ rotası çiziliyor (2 tur)...")
+    for loop in range(2):
+        for (n, e) in inf_rot:
+            goto_NED(n, e, -ALT)
+        goto_NED(B_rot[0], B_rot[1], -ALT)
+
+    # 7. B → A yönüne dönüş
+    print("↩ B'den A yönüne dönüş...")
+    goto_NED(A_rot[0], A_rot[1], -ALT)
+
+    # 8. İniş
+    print("🛬 LAND komutu gönderildi.")
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_LAND,
+        0, 0, 0, 0, 0, 0, 0, 0
+    )
+
+except KeyboardInterrupt:
+    print("❌ Uçuş kullanıcı tarafından iptal edildi.")
