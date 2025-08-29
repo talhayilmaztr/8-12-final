@@ -1,0 +1,189 @@
+from pymavlink import mavutil
+from dronekit import connect, VehicleMode, LocationGlobalRelative
+import time, math
+import numpy as np
+import matplotlib.pyplot as plt
+
+# === Parametreler ===
+ALT = 10.0
+SPEED = 10.0
+DT = 0.04
+NPTS = 720
+direct_distance = 30.0
+width_ratio = 1.4
+yaw_deg = 0.0
+R = 6378137.0
+
+# === MAVLink bağlantısı ===
+print("MAVLink bağlantısı kuruluyor...")
+master = mavutil.mavlink_connection('/dev/ttyAMA0', baud=57600)
+master.wait_heartbeat()
+print("Bağlantı kuruldu. Heartbeat alındı.")
+
+# === PARAM ayarları ===
+def set_param(param_id, param_value):
+    master.mav.param_set_send(
+        master.target_system,
+        master.target_component,
+        param_id.encode('utf-8'),
+        param_value,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+    time.sleep(1)
+    while True:
+        msg = master.recv_match(type='PARAM_VALUE', blocking=True)
+        if msg.param_id.strip() == param_id:
+            break
+
+# === MODE ayarı ===
+def set_mode(mode):
+    mode_id = master.mode_mapping()[mode]
+    master.set_mode(mode_id)
+    while True:
+        ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)
+        if ack_msg.command == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+            break
+
+# === Kalkış komutu (MAV_CMD_NAV_TAKEOFF) ===
+def takeoff(alt):
+    print(f"{alt} metreye kalkılıyor...")
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        0, 0, 0, 0, 0, 0, 0, alt
+    )
+    time.sleep(10)
+
+# === DroneKit bağlantısı (log, konum, görev kontrolü için) ===
+vehicle = connect('127.0.0.1:14550', wait_ready=True)
+
+# === Yardımcı Fonksiyonlar ===
+def set_speed(vehicle, v=SPEED):
+    vehicle.groundspeed = v
+    vehicle.airspeed = v
+    msg = vehicle.message_factory.command_long_encode(
+        0, 0, mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+        0, 0, v, -1, 0, 0, 0, 0
+    )
+    vehicle.send_mavlink(msg)
+
+def ned_to_location(lat0, lon0, alt, n, e):
+    dLat = n / R
+    dLon = e / (R * math.cos(math.radians(lat0)))
+    return LocationGlobalRelative(lat0 + math.degrees(dLat),
+                                  lon0 + math.degrees(dLon), alt)
+
+def location_to_ne(lat0, lon0, lat, lon):
+    dLat = math.radians(lat - lat0)
+    dLon = math.radians(lon - lon0)
+    n = dLat * R
+    e = dLon * R * math.cos(math.radians(lat0))
+    return n, e
+
+def goto_NE(vehicle, lat0, lon0, alt, n, e, rad=1.0, tmax=25):
+    tgt = ned_to_location(lat0, lon0, alt, n, e)
+    vehicle.simple_goto(tgt)
+    t0 = time.time()
+    while True:
+        pos = vehicle.location.global_relative_frame
+        if pos.lat is None: time.sleep(0.05); continue
+        nn, ee = location_to_ne(lat0, lon0, pos.lat, pos.lon)
+        if math.hypot(nn-n, ee-e) <= rad: break
+        if time.time()-t0 > tmax: break
+        time.sleep(0.05)
+
+def rotate_points(points, yaw_deg):
+    yaw = math.radians(yaw_deg)
+    c, s = math.cos(yaw), math.sin(yaw)
+    return [(c*n - s*e, s*n + c*e) for (n,e) in points]
+
+def build_geometry(D, width_ratio):
+    H = D / 2.0
+    W = width_ratio * H
+    AB = H / math.sqrt(2.0)
+    Cn, Ce = 0.0, -W/2.0
+    tB = math.pi/4
+    B = (Cn + H*math.cos(tB), Ce + (W/2.0)*math.sin(2*tB))
+    return H, W, Cn, Ce, AB, tB, B
+
+def infinity_path(Cn, Ce, H, W, t_start, npts=NPTS, start_up=True):
+    if start_up:
+        t = np.linspace(t_start, t_start - 2*math.pi, npts, endpoint=True)
+    else:
+        t = np.linspace(t_start, t_start + 2*math.pi, npts, endpoint=True)
+    N = Cn + H*np.cos(t)
+    E = Ce + (W/2.0)*np.sin(2*t)
+    return list(zip(N, E))
+
+# === Ana Akış ===
+try:
+    # ARMING ve MOD
+    set_param('ARMING_CHECK', 0)
+    set_param('DISARM_DELAY', 127)
+    set_mode('GUIDED')
+    master.arducopter_arm()
+    master.motors_armed_wait()
+    print("Motorlar arm edildi.")
+
+    # MAV_CMD_NAV_TAKEOFF ile kalk
+    takeoff(ALT)
+
+    # DroneKit hız ve konum
+    set_speed(vehicle, SPEED)
+    home = vehicle.location.global_relative_frame
+    lat0, lon0 = home.lat, home.lon
+
+    # Geometri oluştur
+    H, W, Cn, Ce, AB, tB, B_local = build_geometry(direct_distance, width_ratio)
+    A_local = (0.0, 0.0)
+    inf_local = infinity_path(Cn, Ce, H, W, t_start=tB, npts=NPTS, start_up=True)
+
+    A_rot = rotate_points([A_local], yaw_deg)[0]
+    B_rot = rotate_points([B_local], yaw_deg)[0]
+    inf_rot = rotate_points(inf_local, yaw_deg)
+
+    # Görev Akışı
+    goto_NE(vehicle, lat0, lon0, ALT, B_rot[0], B_rot[1])
+
+    flight_log = []
+    for loop in range(2):
+        for (n, e) in inf_rot:
+            vehicle.simple_goto(ned_to_location(lat0, lon0, ALT, n, e))
+            time.sleep(DT)
+            p = vehicle.location.global_relative_frame
+            if p.lat is not None:
+                flight_log.append((p.lat, p.lon))
+        goto_NE(vehicle, lat0, lon0, ALT, B_rot[0], B_rot[1], rad=0.8, tmax=15)
+
+    goto_NE(vehicle, lat0, lon0, ALT, A_rot[0], A_rot[1], rad=0.8, tmax=20)
+
+    print("LAND...")
+    vehicle.mode = VehicleMode("LAND")
+    time.sleep(5)
+    vehicle.close()
+
+    # === Grafik ===
+    planN = [A_rot[0], B_rot[0]] + [p[0] for p in inf_rot] + [p[0] for p in inf_rot] + [A_rot[0]]
+    planE = [A_rot[1], B_rot[1]] + [p[1] for p in inf_rot] + [p[1] for p in inf_rot] + [A_rot[1]]
+
+    logN, logE = [], []
+    for (lat, lon) in flight_log:
+        n, e = location_to_ne(lat0, lon0, lat, lon)
+        logN.append(n)
+        logE.append(e)
+
+    plt.figure(figsize=(7, 7))
+    plt.plot(planE, planN, label=f"Plan (D={direct_distance} m, yaw={yaw_deg}°)", linewidth=2.6)
+    plt.plot(logE, logN, label="Uçuş (GPS→N-E)", linewidth=2.0)
+    plt.scatter([A_rot[1], B_rot[1]], [A_rot[0], B_rot[0]], s=70)
+    plt.text(A_rot[1], A_rot[0]-1.2, "A (kalkış/iniş hattı)", ha='center', fontweight='bold')
+    plt.text(B_rot[1], B_rot[0]+1.2, "B (yan teğet)", ha='center', fontweight='bold')
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.grid(True); plt.legend()
+    plt.title("A → B → ∞ (2 tur, B’den yukarı) → A yönünde AB kadar → LAND")
+    plt.xlabel("E (m)"); plt.ylabel("N (m)")
+    plt.tight_layout(); plt.show()
+
+except KeyboardInterrupt:
+    print("Uçuş kullanıcı tarafından iptal edildi.")
